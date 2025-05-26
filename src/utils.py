@@ -11,12 +11,31 @@ import openai
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
-else:
-    print("WARNING: OPENAI_API_KEY not set. Embedding creation will fail.")
 
 # Configuration constants
-EMBEDDING_DIMENSION = 1536  # text-embedding-3-small has 1536 dimensions
+EMBEDDING_MODEL_DIMENSIONS = {
+    "text-embedding-3-small": 1536,
+    "text-embedding-3-large": 3072,
+    "text-embedding-ada-002": 1536,
+}
+
+# Token limits for OpenAI models
+EMBEDDING_MODEL_TOKEN_LIMITS = {
+    "text-embedding-3-small": 8191,
+    "text-embedding-3-large": 8191,
+    "text-embedding-ada-002": 8191,
+}
+
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+# Force 1536 dimensions to match database schema
+EMBEDDING_DIMENSION = 1536  # Database is hardcoded to vector(1536)
+if EMBEDDING_MODEL not in EMBEDDING_MODEL_DIMENSIONS:
+    print(f"WARNING: Unknown embedding model '{EMBEDDING_MODEL}'. Using text-embedding-3-small.")
+    EMBEDDING_MODEL = "text-embedding-3-small"
+elif EMBEDDING_MODEL_DIMENSIONS[EMBEDDING_MODEL] != 1536:
+    print(f"WARNING: {EMBEDDING_MODEL} has {EMBEDDING_MODEL_DIMENSIONS[EMBEDDING_MODEL]} dimensions but database expects 1536. Using text-embedding-3-small.")
+    EMBEDDING_MODEL = "text-embedding-3-small"
+
 MAX_DOCUMENT_LENGTH = int(os.getenv("MAX_DOCUMENT_LENGTH", "25000"))
 
 def get_supabase_client() -> Client:
@@ -48,38 +67,63 @@ def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
         return []
     
     if not OPENAI_API_KEY:
-        print("ERROR: Cannot create embeddings - OPENAI_API_KEY not set")
-        return [[0.0] * EMBEDDING_DIMENSION for _ in range(len(texts))]
+        error_msg = "Cannot create embeddings - OPENAI_API_KEY not set"
+        print(f"ERROR: {error_msg}")
+        raise RuntimeError(error_msg)
+    
+    # Validate token lengths
+    import tiktoken
+    try:
+        encoding = tiktoken.encoding_for_model(EMBEDDING_MODEL)
+    except KeyError:
+        # Fallback for unknown models
+        encoding = tiktoken.get_encoding("cl100k_base")
+    
+    max_tokens = EMBEDDING_MODEL_TOKEN_LIMITS.get(EMBEDDING_MODEL, 8191)
+    validated_texts = []
+    
+    for text in texts:
+        tokens = encoding.encode(text)
+        if len(tokens) > max_tokens:
+            print(f"WARNING: Text exceeds {max_tokens} token limit ({len(tokens)} tokens). Truncating...")
+            # Truncate to fit within token limit
+            truncated_tokens = tokens[:max_tokens]
+            validated_texts.append(encoding.decode(truncated_tokens))
+        else:
+            validated_texts.append(text)
         
     try:
         response = openai.embeddings.create(
             model=EMBEDDING_MODEL,
-            input=texts
+            input=validated_texts
         )
         return [item.embedding for item in response.data]
     except Exception as e:
         error_msg = f"Error creating batch embeddings: {e}"
         print(error_msg)
-        # Raise exception to propagate error instead of silently failing
         raise RuntimeError(error_msg) from e
 
-def create_embedding(text: str) -> List[float]:
+def create_embedding(text: str, contextual_prefix: Optional[str] = None) -> List[float]:
     """
     Create an embedding for a single text using OpenAI's API.
     
     Args:
         text: Text to create an embedding for
+        contextual_prefix: Optional contextual prefix to add for retrieval
         
     Returns:
         List of floats representing the embedding
     """
+    # Add contextual prefix if provided (for query embeddings)
+    if contextual_prefix:
+        text = f"{contextual_prefix}\n---\n{text}"
+        
     try:
         embeddings = create_embeddings_batch([text])
-        return embeddings[0] if embeddings else [0.0] * EMBEDDING_DIMENSION
+        return embeddings[0] if embeddings else []
     except Exception as e:
         error_msg = f"Error creating embedding: {e}"
         print(error_msg)
-        # Raise exception to propagate error instead of silently failing
         raise RuntimeError(error_msg) from e
 
 def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, bool]:
@@ -102,7 +146,7 @@ def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, 
         return chunk, False
     
     # Validate model choice
-    valid_models = ["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4o", "gpt-4o-mini"]
+    valid_models = ["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4o", "gpt-4o-mini", "o1-preview", "o1-mini"]
     if model_choice not in valid_models:
         print(f"WARNING: Invalid model '{model_choice}'. Using original chunk.")
         return chunk, False
@@ -274,6 +318,10 @@ def add_documents_to_supabase(
                 "embedding": batch_embeddings[j]  # Use embedding from contextual content
             }
             
+            # If contextual embedding was used, store the contextual content
+            if use_contextual_embeddings and batch_metadatas[j].get("contextual_embedding"):
+                data["contextual_content"] = contextual_contents[j]
+            
             batch_data.append(data)
         
         # Upsert batch into Supabase (insert or update based on unique constraint)
@@ -286,7 +334,8 @@ def search_documents(
     client: Client, 
     query: str, 
     match_count: int = 10, 
-    filter_metadata: Optional[Dict[str, Any]] = None
+    filter_metadata: Optional[Dict[str, Any]] = None,
+    contextual_search: bool = True
 ) -> List[Dict[str, Any]]:
     """
     Search for documents in Supabase using vector similarity.
@@ -296,26 +345,37 @@ def search_documents(
         query: Query text
         match_count: Maximum number of results to return
         filter_metadata: Optional metadata filter
+        contextual_search: Whether to use contextual search (should match storage)
         
     Returns:
         List of matching documents
     """
     # Validate query
     if not query or not query.strip():
-        print("WARNING: Empty query provided for search")
-        return []
+        error_msg = "Empty query provided for search"
+        print(f"ERROR: {error_msg}")
+        raise ValueError(error_msg)
         
     # Validate match_count
     if match_count <= 0:
         print(f"WARNING: Invalid match_count {match_count}, using default 10")
         match_count = 10
     
+    # Check if contextual embeddings are being used in storage
+    use_contextual = os.getenv("MODEL_CHOICE") and contextual_search
+    
     # Create embedding for the query
     try:
-        query_embedding = create_embedding(query)
+        if use_contextual:
+            # Generate contextual prefix for the query
+            contextual_prefix = "This is a search query looking for relevant content about:"
+            query_embedding = create_embedding(query, contextual_prefix=contextual_prefix)
+        else:
+            query_embedding = create_embedding(query)
     except Exception as e:
-        print(f"Failed to create embedding for query: {e}")
-        return []
+        error_msg = f"Failed to create embedding for query: {e}"
+        print(f"ERROR: {error_msg}")
+        raise RuntimeError(error_msg) from e
     
     # Execute the search using the match_crawled_pages function
     try:
@@ -331,7 +391,15 @@ def search_documents(
         
         result = client.rpc('match_crawled_pages', params).execute()
         
-        return result.data
+        results = result.data
+        
+        # If we have contextual content stored, return that instead of original content
+        for result in results:
+            if result.get('contextual_content'):
+                result['content'] = result['contextual_content']
+                
+        return results
     except Exception as e:
-        print(f"Error searching documents: {e}")
-        return []
+        error_msg = f"Database error searching documents: {e}"
+        print(f"ERROR: {error_msg}")
+        raise RuntimeError(error_msg) from e

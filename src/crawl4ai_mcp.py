@@ -878,11 +878,29 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
             "results": formatted_results,
             "count": len(formatted_results)
         }, indent=2)
-    except Exception as e:
+    except ValueError as e:
+        # Query validation errors
         return json.dumps({
             "success": False,
             "query": query,
-            "error": str(e)
+            "error": f"Invalid query: {str(e)}",
+            "error_type": "validation_error"
+        }, indent=2)
+    except RuntimeError as e:
+        # API or database errors
+        return json.dumps({
+            "success": False,
+            "query": query,
+            "error": str(e),
+            "error_type": "runtime_error"
+        }, indent=2)
+    except Exception as e:
+        # Unexpected errors
+        return json.dumps({
+            "success": False,
+            "query": query,
+            "error": f"Unexpected error: {str(e)}",
+            "error_type": "unknown_error"
         }, indent=2)
 
 async def main():
