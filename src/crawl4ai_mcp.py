@@ -335,11 +335,10 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
         crawler = ctx.request_context.lifespan_context.crawler
         supabase_client = ctx.request_context.lifespan_context.supabase_client
         
-        # Configure the crawl with timeout
+        # Configure the crawl
         run_config = CrawlerRunConfig(
             cache_mode=CacheMode.BYPASS, 
-            stream=False,
-            timeout=DEFAULT_TIMEOUT
+            stream=False
         )
         
         # Crawl the page
@@ -629,8 +628,7 @@ async def crawl_markdown_file(crawler: AsyncWebCrawler, url: str) -> List[Dict[s
     """
     crawl_config = CrawlerRunConfig(
         cache_mode=CacheMode.BYPASS, 
-        stream=False,
-        timeout=DEFAULT_TIMEOUT
+        stream=False
     )
 
     result = await crawler.arun(url=url, config=crawl_config)
@@ -654,8 +652,7 @@ async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent:
     """
     crawl_config = CrawlerRunConfig(
         cache_mode=CacheMode.BYPASS, 
-        stream=False,
-        timeout=DEFAULT_TIMEOUT
+        stream=False
     )
     dispatcher = MemoryAdaptiveDispatcher(
         memory_threshold_percent=DEFAULT_MEMORY_THRESHOLD,
@@ -682,8 +679,7 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
     """
     run_config = CrawlerRunConfig(
         cache_mode=CacheMode.BYPASS, 
-        stream=False,
-        timeout=30000  # 30 second timeout per page
+        stream=False
     )
     dispatcher = MemoryAdaptiveDispatcher(
         memory_threshold_percent=DEFAULT_MEMORY_THRESHOLD,
@@ -716,8 +712,6 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
         next_level_urls = set()
 
         for result in results:
-            norm_url = normalize_url(result.url)
-
             if result.success and result.markdown:
                 results_all.append({'url': result.url, 'markdown': result.markdown})
                 
