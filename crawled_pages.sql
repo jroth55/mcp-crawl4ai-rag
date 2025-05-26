@@ -6,8 +6,9 @@ create table crawled_pages (
     id bigserial primary key,
     url varchar not null,
     chunk_number integer not null,
-    content text not null,  -- Added content column
-    metadata jsonb not null default '{}'::jsonb,  -- Added metadata column
+    content text not null,  -- Original content
+    contextual_content text,  -- Content with context (used when contextual embeddings are enabled)
+    metadata jsonb not null default '{}'::jsonb,  -- Metadata including source, chunk_size, etc.
     embedding vector(1536),  -- OpenAI embeddings are 1536 dimensions
     created_at timestamp with time zone default timezone('utc'::text, now()) not null,
     
@@ -21,7 +22,11 @@ create index on crawled_pages using ivfflat (embedding vector_cosine_ops);
 -- Create an index on metadata for faster filtering
 create index idx_crawled_pages_metadata on crawled_pages using gin (metadata);
 
-CREATE INDEX idx_crawled_pages_source ON crawled_pages ((metadata->>'source'));
+-- Create an index on source for faster filtering by source
+create index idx_crawled_pages_source on crawled_pages ((metadata->>'source'));
+
+-- Create an index on contextual_content for text search (optional, but helpful for full-text search)
+create index idx_crawled_pages_contextual_content on crawled_pages using gin(to_tsvector('english', contextual_content));
 
 -- Create a function to search for documentation chunks
 create or replace function match_crawled_pages (
@@ -33,6 +38,7 @@ create or replace function match_crawled_pages (
   url varchar,
   chunk_number integer,
   content text,
+  contextual_content text,
   metadata jsonb,
   similarity float
 )
@@ -46,6 +52,7 @@ begin
     url,
     chunk_number,
     content,
+    contextual_content,
     metadata,
     1 - (crawled_pages.embedding <=> query_embedding) as similarity
   from crawled_pages

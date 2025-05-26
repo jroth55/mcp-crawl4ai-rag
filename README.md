@@ -430,7 +430,8 @@ perform_rag_query(
 
 3. **"Invalid model" errors**
    - Ensure `MODEL_CHOICE` is set to a valid OpenAI model
-   - Valid models: gpt-3.5-turbo, gpt-4, gpt-4-turbo, gpt-4o, gpt-4o-mini
+   - Recommended: gpt-4.1-mini (default), gpt-4.1-nano
+   - Also valid: gpt-3.5-turbo, gpt-4, gpt-4-turbo, gpt-4o, gpt-4o-mini, o3-mini, o4-mini
 
 4. **Database connection issues**
    - Verify `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` are correct

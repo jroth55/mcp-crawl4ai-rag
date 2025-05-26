@@ -146,7 +146,8 @@ def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, 
         return chunk, False
     
     # Validate model choice
-    valid_models = ["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4o", "gpt-4o-mini", "o1-preview", "o1-mini"]
+    valid_models = ["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4o", "gpt-4o-mini", 
+                    "gpt-4.1-mini", "gpt-4.1-nano", "o1-preview", "o1-mini", "o3-mini", "o4-mini"]
     if model_choice not in valid_models:
         print(f"WARNING: Invalid model '{model_choice}'. Using original chunk.")
         return chunk, False
