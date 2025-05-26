@@ -83,3 +83,25 @@ create policy "Allow public read access"
   for select
   to public
   using (true);
+
+-- Create a policy that allows service role to insert
+create policy "Allow service role insert"
+  on crawled_pages
+  for insert
+  to service_role
+  with check (true);
+
+-- Create a policy that allows service role to update
+create policy "Allow service role update"
+  on crawled_pages
+  for update
+  to service_role
+  using (true)
+  with check (true);
+
+-- Create a policy that allows service role to delete
+create policy "Allow service role delete"
+  on crawled_pages
+  for delete
+  to service_role
+  using (true);
