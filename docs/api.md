@@ -93,7 +93,8 @@ async def smart_crawl_url(
     max_depth: int = 3, 
     max_concurrent: int = 10, 
     chunk_size: int = 5000, 
-    prefix: str = None
+    prefix: str = None,
+    sitemap_max_depth: int = None
 ) -> str
 ```
 
@@ -107,6 +108,7 @@ async def smart_crawl_url(
 | `max_concurrent` | integer | No | 10 | Number of parallel browser sessions (1-50) |
 | `chunk_size` | integer | No | 5000 | Characters per chunk for storage |
 | `prefix` | string | No | Auto-detected | URL prefix to restrict crawling scope |
+| `sitemap_max_depth` | integer | No | From env | Maximum recursion depth for nested sitemap indexes |
 
 ### Auto-Detection Behavior
 
@@ -135,6 +137,8 @@ JSON string containing:
   "url": "https://docs.example.com",
   "crawl_type": "webpage",
   "pages_crawled": 42,
+  "pages_processed": 40,
+  "chunks_prepared": 180,
   "chunks_stored": 156,
   "urls_crawled": [
     "https://docs.example.com/",
@@ -144,6 +148,27 @@ JSON string containing:
     "https://docs.example.com/reference",
     "..."
   ]
+}
+```
+
+When partial failures occur, an additional `partial_failures` object is included:
+
+```json
+{
+  "success": true,
+  "url": "https://docs.example.com",
+  "crawl_type": "webpage",
+  "pages_crawled": 42,
+  "pages_processed": 40,
+  "chunks_prepared": 180,
+  "chunks_stored": 156,
+  "partial_failures": {
+    "storage_errors": 24,
+    "failed_batches": 2,
+    "total_batches": 5,
+    "success_rate": "86.7%"
+  },
+  "urls_crawled": ["..."]
 }
 ```
 
@@ -492,14 +517,34 @@ def answer_question(question):
 
 The following environment variables affect API behavior:
 
+### Crawler Configuration
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CRAWLER_TIMEOUT` | 30000 | Timeout per page in milliseconds |
 | `CRAWLER_MEMORY_THRESHOLD` | 70.0 | Memory threshold for adaptive dispatcher (%) |
 | `CRAWLER_CHECK_INTERVAL` | 1.0 | Memory check interval in seconds |
 | `MAX_DOCUMENT_LENGTH` | 25000 | Max document length for contextual embeddings |
+| `SITEMAP_MAX_DEPTH` | 2 | Maximum recursion depth for nested sitemap indexes |
+
+### OpenAI Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
 | `EMBEDDING_MODEL` | text-embedding-3-small | OpenAI embedding model |
 | `MODEL_CHOICE` | None | Model for contextual embeddings (optional) |
+| `OPENAI_MAX_RETRIES` | 3 | Maximum retries for OpenAI API calls |
+| `OPENAI_RETRY_DELAY` | 1.0 | Initial delay between retries (seconds) |
+| `OPENAI_TIMEOUT` | 30 | Timeout for OpenAI API calls (seconds) |
+
+### Batch Processing Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `EMBEDDING_BATCH_SIZE` | 20 | Number of text chunks per OpenAI embeddings API call |
+| `DOCUMENT_BATCH_SIZE` | 10 | Number of documents to process in memory at once |
+| `THREAD_POOL_MAX_WORKERS` | 10 | Max concurrent threads for contextual embeddings |
+| `BATCH_FAILURE_THRESHOLD` | 0.5 | Fail if more than this percentage of batches fail |
 
 ## Error Handling
 

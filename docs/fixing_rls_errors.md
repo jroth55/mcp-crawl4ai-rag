@@ -9,13 +9,13 @@ Error upserting batch into Supabase: {'message': 'new row violates row-level sec
 This occurs because the `crawled_pages` table has Row-Level Security (RLS) enabled but lacks the necessary policies to allow the service role to insert, update, or delete data.
 
 ## Root Cause
-The original `crawled_pages.sql` only included a SELECT policy for public read access but didn't include INSERT, UPDATE, or DELETE policies for the service role. When RLS is enabled on a table without appropriate policies, PostgreSQL denies all operations by default.
+If you're using an older version of `crawled_pages.sql` or if RLS policies were manually modified, you may be missing the necessary INSERT, UPDATE, or DELETE policies for the service role. When RLS is enabled on a table without appropriate policies, PostgreSQL denies all operations by default.
 
 ## Solution
 
-### Option 1: Run the Fix Script (Recommended)
+### Option 1: Re-run the RLS Section from crawled_pages.sql (Recommended)
 1. Connect to your Supabase database using the SQL editor in the Supabase dashboard
-2. Run the provided `fix_rls_policies.sql` script:
+2. Run the RLS section from the `crawled_pages.sql` file (lines 77-111):
    ```sql
    -- Drop existing RLS policies if they exist
    drop policy if exists "Allow public read access" on crawled_pages;
@@ -74,7 +74,9 @@ The original `crawled_pages.sql` only included a SELECT policy for public read a
      - USING expression: `true`
 
 ### Option 3: Recreate the Table
-If you're starting fresh, you can drop and recreate the table with the updated `crawled_pages.sql` that includes all necessary policies.
+If you're starting fresh, you can drop and recreate the table with the current `crawled_pages.sql` which includes all necessary policies.
+
+**Note**: The latest version of `crawled_pages.sql` includes DROP POLICY IF EXISTS statements, making it idempotent. You can safely re-run the entire script or just the RLS section to reset policies to their default state.
 
 ## Verification
 After applying the fix, verify the policies are correctly set:

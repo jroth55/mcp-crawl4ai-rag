@@ -14,14 +14,22 @@ from xml.etree import ElementTree
 from dotenv import load_dotenv
 from supabase import Client
 from pathlib import Path
-import requests
+import httpx
 import asyncio
 import json
 import os
 import re
 import gzip
 import threading
+import logging
 from datetime import datetime, timezone
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher
 from utils import get_supabase_client, add_documents_to_supabase, search_documents
@@ -32,6 +40,8 @@ DEFAULT_MEMORY_THRESHOLD = float(os.getenv("CRAWLER_MEMORY_THRESHOLD", "70.0"))
 DEFAULT_CHECK_INTERVAL = float(os.getenv("CRAWLER_CHECK_INTERVAL", "1.0"))
 DEFAULT_TIMEOUT = int(os.getenv("CRAWLER_TIMEOUT", "30000"))  # 30 seconds
 MAX_DOCUMENT_LENGTH = int(os.getenv("MAX_DOCUMENT_LENGTH", "25000"))
+DOCUMENT_BATCH_SIZE = int(os.getenv("DOCUMENT_BATCH_SIZE", "10"))  # Process N documents at a time
+SITEMAP_MAX_DEPTH = int(os.getenv("SITEMAP_MAX_DEPTH", "2"))  # Max recursion depth for sitemap indexes
 
 # Load environment variables from the project root .env file
 project_root = Path(__file__).resolve().parent.parent
@@ -81,7 +91,7 @@ async def crawl4ai_lifespan(server: AuthenticatedFastMCP) -> AsyncIterator[Crawl
         try:
             await crawler.__aexit__(None, None, None)
         except Exception as e:
-            print(f"Error during crawler cleanup: {e}")
+            logger.error(f"Error during crawler cleanup: {e}")
             # Continue cleanup even if crawler cleanup fails
 
 # Initialize AuthenticatedFastMCP server
@@ -108,6 +118,31 @@ def normalize_url_for_comparison(url: str) -> str:
     url = url.rstrip('/')
     # Remove protocol for comparison
     return url.replace('https://', '').replace('http://', '')
+
+def is_binary_file(url: str) -> bool:
+    """
+    Check if URL points to a binary file that shouldn't be crawled.
+    
+    Args:
+        url: URL to check
+        
+    Returns:
+        True if the URL points to a binary file, False otherwise
+    """
+    binary_extensions = [
+        '.zip', '.gz', '.tar', '.rar', '.7z',  # Archives
+        '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',  # Documents
+        '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.svg', '.ico',  # Images
+        '.mp3', '.mp4', '.avi', '.mov', '.wmv', '.flv',  # Media
+        '.exe', '.dmg', '.pkg', '.deb', '.rpm',  # Executables
+        '.jar', '.war', '.ear',  # Java archives
+        '.woff', '.woff2', '.ttf', '.eot',  # Fonts
+    ]
+    url_lower = url.lower()
+    # Special handling for .xml.gz files (keep them as they're often sitemaps)
+    if url_lower.endswith('.xml.gz'):
+        return False
+    return any(url_lower.endswith(ext) for ext in binary_extensions)
 
 def is_sitemap(url: str) -> bool:
     """
@@ -138,7 +173,7 @@ def is_txt(url: str) -> bool:
     """
     return url.endswith('.txt')
 
-def parse_sitemap(sitemap_url: str, max_depth: int = 2, current_depth: int = 0) -> List[str]:
+async def parse_sitemap(sitemap_url: str, max_depth: int = SITEMAP_MAX_DEPTH, current_depth: int = 0) -> List[str]:
     """
     Parse a sitemap and extract URLs. Handles gzipped sitemaps and sitemap index files.
     
@@ -155,7 +190,8 @@ def parse_sitemap(sitemap_url: str, max_depth: int = 2, current_depth: int = 0) 
         
     try:
         headers = {'Accept-Encoding': 'gzip'}
-        resp = requests.get(sitemap_url, timeout=30, headers=headers)
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(sitemap_url, timeout=30, headers=headers)
         urls = []
 
         if resp.status_code == 200:
@@ -178,27 +214,47 @@ def parse_sitemap(sitemap_url: str, max_depth: int = 2, current_depth: int = 0) 
                     for sitemap in sitemap_nodes:
                         loc = sitemap.find('./{*}loc')
                         if loc is not None and loc.text:
-                            sub_urls = parse_sitemap(loc.text, max_depth, current_depth + 1)
+                            sub_urls = await parse_sitemap(loc.text, max_depth, current_depth + 1)
                             urls.extend(sub_urls)
                 else:
                     # Regular sitemap - extract URLs
                     urls = [loc.text for loc in tree.findall('.//{*}loc') if loc.text]
             except Exception as e:
-                print(f"Error parsing sitemap XML from {sitemap_url}: {e}")
+                logger.error(f"Error parsing sitemap XML from {sitemap_url}: {e}")
         else:
-            print(f"Failed to fetch sitemap {sitemap_url}: HTTP {resp.status_code}")
-    except requests.RequestException as e:
-        print(f"Error fetching sitemap {sitemap_url}: {e}")
+            logger.warning(f"Failed to fetch sitemap {sitemap_url}: HTTP {resp.status_code}")
+    except httpx.RequestError as e:
+        logger.error(f"Error fetching sitemap {sitemap_url}: {e}")
         urls = []
 
     return urls
 
 def smart_chunk_markdown(text: str, chunk_size: int = 5000) -> List[str]:
-    """Split text into chunks, respecting code blocks and paragraphs."""
+    """
+    Split text into chunks, respecting code blocks and paragraphs.
+    
+    Args:
+        text: Markdown text to chunk
+        chunk_size: Target size for each chunk
+        
+    Returns:
+        List of text chunks
+        
+    Raises:
+        ValueError: If chunk_size is invalid
+    """
+    if chunk_size <= 0:
+        raise ValueError(f"Invalid chunk_size: {chunk_size}")
+        
+    if not text:
+        return []
+        
     chunks = []
     start = 0
     text_length = len(text)
+    max_iterations = text_length // 100 + 1000  # Prevent infinite loops
 
+    iteration = 0
     while start < text_length:
         # Calculate end position
         end = start + chunk_size
@@ -261,6 +317,15 @@ def smart_chunk_markdown(text: str, chunk_size: int = 5000) -> List[str]:
 
         # Move start position for next chunk
         start = end
+        
+        # Safety check to prevent infinite loops
+        iteration += 1
+        if iteration > max_iterations:
+            logger.error(f"Maximum iterations ({max_iterations}) exceeded in smart_chunk_markdown. Breaking loop.")
+            # Add remaining text as final chunk if any
+            if start < text_length:
+                chunks.append(text[start:].strip())
+            break
 
     return chunks
 
@@ -282,6 +347,84 @@ def extract_section_info(chunk: str) -> Dict[str, Any]:
         "char_count": len(chunk),
         "word_count": len(chunk.split())
     }
+
+async def process_crawl_results_batch(
+    supabase_client: Client,
+    crawl_results_batch: List[Dict[str, Any]],
+    chunk_size: int,
+    crawl_type: str
+) -> Dict[str, int]:
+    """
+    Process a batch of crawl results and store in Supabase.
+    Memory-efficient by processing documents in smaller batches.
+    
+    Args:
+        supabase_client: Supabase client
+        crawl_results_batch: Batch of crawl results to process
+        chunk_size: Size for text chunking
+        crawl_type: Type of crawl (webpage, sitemap, text_file)
+        
+    Returns:
+        Dictionary with detailed statistics:
+        - chunks_stored: Number of chunks successfully stored
+        - chunks_prepared: Total chunks prepared for storage
+        - pages_processed: Number of pages in this batch
+        - storage_errors: Number of storage errors
+    """
+    urls = []
+    chunk_numbers = []
+    contents = []
+    metadatas = []
+    url_to_full_document = {}
+    
+    # Process each document in the batch
+    for doc in crawl_results_batch:
+        source_url = doc['url']
+        md = doc['markdown']
+        
+        # Store full document for contextual embeddings
+        url_to_full_document[source_url] = md
+        
+        # Chunk the document
+        chunks = smart_chunk_markdown(md, chunk_size=chunk_size)
+        
+        for i, chunk in enumerate(chunks):
+            urls.append(source_url)
+            chunk_numbers.append(i)
+            contents.append(chunk)
+            
+            # Extract metadata
+            meta = extract_section_info(chunk)
+            meta["chunk_index"] = i
+            meta["url"] = source_url
+            meta["source"] = urlparse(source_url).netloc
+            meta["crawl_type"] = crawl_type
+            meta["crawl_time"] = datetime.now(timezone.utc).isoformat()
+            metadatas.append(meta)
+    
+    # Store in Supabase
+    stats = {
+        "chunks_stored": 0,
+        "chunks_prepared": len(urls),
+        "pages_processed": len(crawl_results_batch),
+        "storage_errors": 0
+    }
+    
+    if urls:
+        try:
+            chunks_stored = add_documents_to_supabase(
+                supabase_client, urls, chunk_numbers, contents, 
+                metadatas, url_to_full_document
+            )
+            stats["chunks_stored"] = chunks_stored
+            if chunks_stored < stats["chunks_prepared"]:
+                stats["storage_errors"] = stats["chunks_prepared"] - chunks_stored
+        except Exception as e:
+            logger.error(f"Error storing batch: {e}")
+            stats["storage_errors"] = stats["chunks_prepared"]
+            # Don't re-raise, let the caller handle partial failures
+    
+    return stats
 
 @mcp.tool()
 async def crawl_single_page(ctx: Context, url: str) -> str:
@@ -397,7 +540,7 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
         }, indent=2)
 
 @mcp.tool()
-async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concurrent: int = 10, chunk_size: int = 5000, prefix: str = None) -> str:
+async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concurrent: int = 10, chunk_size: int = 5000, prefix: str = None, sitemap_max_depth: int = None) -> str:
     """
     Intelligently crawl websites and store all content for RAG queries. Auto-detects sitemaps and follows links.
     
@@ -427,6 +570,7 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         max_concurrent: Parallel browser sessions (default: 10, reduce if rate limited)
         chunk_size: Characters per chunk for storage (default: 5000)
         prefix: Optional - Only crawl URLs starting with this prefix. Defaults to current subdirectory.
+        sitemap_max_depth: Maximum recursion depth for nested sitemap indexes (default: from SITEMAP_MAX_DEPTH env var)
     
     Returns:
         JSON with pages crawled, chunks stored, and list of URLs processed
@@ -474,18 +618,18 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         if max_depth < 0:
             max_depth = 0
         elif max_depth > 10:
-            print(f"WARNING: max_depth {max_depth} is very high, capping at 10")
+            logger.warning(f"max_depth {max_depth} is very high, capping at 10")
             max_depth = 10
             
         if max_concurrent <= 0:
-            print(f"WARNING: Invalid max_concurrent {max_concurrent}, using default 10")
+            logger.warning(f"Invalid max_concurrent {max_concurrent}, using default 10")
             max_concurrent = 10
         elif max_concurrent > 50:
-            print(f"WARNING: max_concurrent {max_concurrent} is very high, capping at 50")
+            logger.warning(f"max_concurrent {max_concurrent} is very high, capping at 50")
             max_concurrent = 50
             
         if chunk_size <= 0:
-            print(f"WARNING: Invalid chunk_size {chunk_size}, using default 5000")
+            logger.warning(f"Invalid chunk_size {chunk_size}, using default 5000")
             chunk_size = 5000
         
         # Get the crawler and Supabase client from the context
@@ -524,7 +668,7 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
             crawl_type = "text_file"
         elif is_sitemap(url):
             # For sitemaps, extract URLs and crawl in parallel
-            sitemap_urls = parse_sitemap(url)
+            sitemap_urls = await parse_sitemap(url, max_depth=sitemap_max_depth if sitemap_max_depth is not None else SITEMAP_MAX_DEPTH)
             if not sitemap_urls:
                 return json.dumps({
                     "success": False,
@@ -562,52 +706,74 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                 "error": "No content found"
             }, indent=2)
         
-        # Process results and store in Supabase
-        urls = []
-        chunk_numbers = []
-        contents = []
-        metadatas = []
-        chunk_count = 0
+        # Process results in batches for memory efficiency
+        total_chunks_stored = 0
+        total_chunks_prepared = 0
+        pages_processed = 0
+        total_storage_errors = 0
+        batch_failures = 0
         
-        for doc in crawl_results:
-            source_url = doc['url']
-            md = doc['markdown']
-            chunks = smart_chunk_markdown(md, chunk_size=chunk_size)
+        # Process documents in batches
+        for batch_start in range(0, len(crawl_results), DOCUMENT_BATCH_SIZE):
+            batch_end = min(batch_start + DOCUMENT_BATCH_SIZE, len(crawl_results))
+            batch = crawl_results[batch_start:batch_end]
             
-            for i, chunk in enumerate(chunks):
-                urls.append(source_url)
-                chunk_numbers.append(i)
-                contents.append(chunk)
+            logger.debug(f"Processing document batch {batch_start//DOCUMENT_BATCH_SIZE + 1}: documents {batch_start+1}-{batch_end} of {len(crawl_results)}")
+            
+            try:
+                # Process and store the batch
+                batch_stats = await process_crawl_results_batch(
+                    supabase_client, batch, chunk_size, crawl_type
+                )
                 
-                # Extract metadata
-                meta = extract_section_info(chunk)
-                meta["chunk_index"] = i
-                meta["url"] = source_url
-                meta["source"] = urlparse(source_url).netloc
-                meta["crawl_type"] = crawl_type
-                meta["crawl_time"] = datetime.now(timezone.utc).isoformat()
-                metadatas.append(meta)
+                # Aggregate statistics
+                total_chunks_stored += batch_stats["chunks_stored"]
+                total_chunks_prepared += batch_stats["chunks_prepared"]
+                pages_processed += batch_stats["pages_processed"]
+                total_storage_errors += batch_stats["storage_errors"]
                 
-                chunk_count += 1
+                logger.debug(f"Batch {batch_start//DOCUMENT_BATCH_SIZE + 1} complete: {batch_stats['chunks_stored']}/{batch_stats['chunks_prepared']} chunks stored")
+                
+                if batch_stats["storage_errors"] > 0:
+                    batch_failures += 1
+                
+            except Exception as e:
+                logger.error(f"Error processing batch {batch_start//DOCUMENT_BATCH_SIZE + 1}: {e}")
+                batch_failures += 1
+                # Continue with next batch even if one fails
+                continue
         
-        # Create url_to_full_document mapping
-        url_to_full_document = {}
-        for doc in crawl_results:
-            url_to_full_document[doc['url']] = doc['markdown']
+        # Check if any chunks were stored
+        if total_chunks_stored == 0 and total_chunks_prepared > 0:
+            logger.error(f"Failed to store any chunks for {url}")
+            return json.dumps({
+                "success": False,
+                "url": url,
+                "error": "Failed to store any content in database"
+            }, indent=2)
         
-        # Add to Supabase
-        # IMPORTANT: Adjust this batch size for more speed if you want! Just don't overwhelm your system or the embedding API ;)
-        batch_size = 20
-        add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size=batch_size)
-        
-        return json.dumps({
+        # Prepare response with detailed statistics
+        response = {
             "success": True,
             "url": url,
             "crawl_type": crawl_type,
             "pages_crawled": len(crawl_results),
-            "chunks_stored": chunk_count,
+            "pages_processed": pages_processed,
+            "chunks_prepared": total_chunks_prepared,
+            "chunks_stored": total_chunks_stored,
             "urls_crawled": [doc['url'] for doc in crawl_results][:5] + (["..."] if len(crawl_results) > 5 else [])
-        }, indent=2)
+        }
+        
+        # Add partial failure details if any
+        if total_storage_errors > 0 or batch_failures > 0:
+            response["partial_failures"] = {
+                "storage_errors": total_storage_errors,
+                "failed_batches": batch_failures,
+                "total_batches": (len(crawl_results) + DOCUMENT_BATCH_SIZE - 1) // DOCUMENT_BATCH_SIZE,
+                "success_rate": f"{(total_chunks_stored / total_chunks_prepared * 100):.1f}%" if total_chunks_prepared > 0 else "0%"
+            }
+            
+        return json.dumps(response, indent=2)
     except Exception as e:
         return json.dumps({
             "success": False,
@@ -635,7 +801,7 @@ async def crawl_markdown_file(crawler: AsyncWebCrawler, url: str) -> List[Dict[s
     if result.success and result.markdown:
         return [{'url': url, 'markdown': result.markdown}]
     else:
-        print(f"Failed to crawl {url}: {result.error_message}")
+        logger.error(f"Failed to crawl {url}: {result.error_message}")
         return []
 
 async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent: int = 10) -> List[Dict[str, Any]]:
@@ -650,9 +816,17 @@ async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent:
     Returns:
         List of dictionaries with URL and markdown content
     """
+    # Filter out binary files
+    filtered_urls = [url for url in urls if not is_binary_file(url)]
+    skipped_count = len(urls) - len(filtered_urls)
+    if skipped_count > 0:
+        logger.debug(f"Skipping {skipped_count} binary files from batch crawl")
+    
     crawl_config = CrawlerRunConfig(
         cache_mode=CacheMode.BYPASS, 
-        stream=False
+        stream=False,
+        wait_until="domcontentloaded",  # Don't wait for all resources
+        timeout=DEFAULT_TIMEOUT
     )
     dispatcher = MemoryAdaptiveDispatcher(
         memory_threshold_percent=DEFAULT_MEMORY_THRESHOLD,
@@ -660,8 +834,16 @@ async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent:
         max_session_permit=max_concurrent
     )
 
-    results = await crawler.arun_many(urls=urls, config=crawl_config, dispatcher=dispatcher)
-    return [{'url': r.url, 'markdown': r.markdown} for r in results if r.success and r.markdown]
+    results = await crawler.arun_many(urls=filtered_urls, config=crawl_config, dispatcher=dispatcher)
+    successful_results = []
+    for r in results:
+        if r.success and r.markdown:
+            successful_results.append({'url': r.url, 'markdown': r.markdown})
+            logger.debug(f"Successfully crawled {r.url}")
+        else:
+            logger.warning(f"Failed to crawl {r.url}: {getattr(r, 'error_message', 'Unknown error')}")
+    
+    return successful_results
 
 async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: List[str], max_depth: int = 3, max_concurrent: int = 10, prefix: str = None) -> List[Dict[str, Any]]:
     """
@@ -679,7 +861,9 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
     """
     run_config = CrawlerRunConfig(
         cache_mode=CacheMode.BYPASS, 
-        stream=False
+        stream=False,
+        wait_until="domcontentloaded",  # Don't wait for all resources
+        timeout=DEFAULT_TIMEOUT
     )
     dispatcher = MemoryAdaptiveDispatcher(
         memory_threshold_percent=DEFAULT_MEMORY_THRESHOLD,
@@ -693,27 +877,35 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
 
     def normalize_url(url):
         return urldefrag(url)[0]
+    
 
+    # Filter out binary files from start URLs
+    start_urls = [url for url in start_urls if not is_binary_file(url)]
     current_urls = set([normalize_url(u) for u in start_urls])
     results_all = []
 
     for depth in range(max_depth):
+        logger.debug(f"Crawling depth {depth}, {len(current_urls)} URLs to process")
+        
         # Thread-safe check for unvisited URLs
         with visited_lock:
-            urls_to_crawl = [url for url in current_urls if url not in visited]
+            urls_to_crawl = [url for url in current_urls if url not in visited and not is_binary_file(url)]
             # Mark URLs as visited immediately to prevent duplicates
             for url in urls_to_crawl:
                 visited.add(url)
                 
         if not urls_to_crawl:
+            logger.debug(f"No more URLs to crawl at depth {depth}")
             break
 
+        logger.debug(f"Crawling {len(urls_to_crawl)} URLs at depth {depth}")
         results = await crawler.arun_many(urls=urls_to_crawl, config=run_config, dispatcher=dispatcher)
         next_level_urls = set()
 
         for result in results:
             if result.success and result.markdown:
                 results_all.append({'url': result.url, 'markdown': result.markdown})
+                logger.debug(f"Successfully crawled {result.url}")
                 
                 # Only check internal links from the same domain
                 internal_links = result.links.get("internal", [])
@@ -737,6 +929,11 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
                     # Handle relative URLs by making them absolute
                     next_url = normalize_url(urljoin(result.url, link_href))
                     
+                    # Skip binary files
+                    if is_binary_file(next_url):
+                        logger.debug(f"Skipping binary file: {next_url}")
+                        continue
+                    
                     # First check if the link is from the same domain
                     next_parsed = urlparse(next_url)
                     if next_parsed.netloc != target_domain:
@@ -751,9 +948,13 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
                     with visited_lock:
                         if next_url not in visited:
                             next_level_urls.add(next_url)
+            else:
+                logger.warning(f"Failed to crawl {result.url}: {getattr(result, 'error_message', 'Unknown error')}")
 
         current_urls = next_level_urls
+        logger.debug(f"Found {len(next_level_urls)} new URLs for next depth")
 
+    logger.info(f"Crawl complete. Total pages crawled: {len(results_all)}")
     return results_all
 
 @mcp.tool()

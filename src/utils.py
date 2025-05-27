@@ -2,10 +2,25 @@
 Utility functions for the Crawl4AI MCP server.
 """
 import os
+import time
+import logging
 import concurrent.futures
 from typing import List, Dict, Any, Optional, Tuple
 from supabase import create_client, Client
 import openai
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+# Retry configuration
+OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
+OPENAI_RETRY_DELAY = float(os.getenv("OPENAI_RETRY_DELAY", "1.0"))
+OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "30"))
+
+# Batch processing configuration
+BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "20"))
+THREAD_POOL_MAX_WORKERS = int(os.getenv("THREAD_POOL_MAX_WORKERS", "10"))
+BATCH_FAILURE_THRESHOLD = float(os.getenv("BATCH_FAILURE_THRESHOLD", "0.5"))  # Fail if more than 50% of batches fail
 
 # Load OpenAI API key for embeddings
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -30,13 +45,90 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 # Force 1536 dimensions to match database schema
 EMBEDDING_DIMENSION = 1536  # Database is hardcoded to vector(1536)
 if EMBEDDING_MODEL not in EMBEDDING_MODEL_DIMENSIONS:
-    print(f"WARNING: Unknown embedding model '{EMBEDDING_MODEL}'. Using text-embedding-3-small.")
+    logger.warning(f"Unknown embedding model '{EMBEDDING_MODEL}'. Using text-embedding-3-small.")
     EMBEDDING_MODEL = "text-embedding-3-small"
 elif EMBEDDING_MODEL_DIMENSIONS[EMBEDDING_MODEL] != 1536:
-    print(f"WARNING: {EMBEDDING_MODEL} has {EMBEDDING_MODEL_DIMENSIONS[EMBEDDING_MODEL]} dimensions but database expects 1536. Using text-embedding-3-small.")
+    logger.warning(f"{EMBEDDING_MODEL} has {EMBEDDING_MODEL_DIMENSIONS[EMBEDDING_MODEL]} dimensions but database expects 1536. Using text-embedding-3-small.")
     EMBEDDING_MODEL = "text-embedding-3-small"
 
 MAX_DOCUMENT_LENGTH = int(os.getenv("MAX_DOCUMENT_LENGTH", "25000"))
+
+def is_critical_api_error(exception: Exception) -> bool:
+    """
+    Determine if an exception represents a critical API error that shouldn't be retried.
+    
+    Args:
+        exception: The exception to check
+        
+    Returns:
+        True if this is a critical error that shouldn't be retried
+    """
+    error_str = str(exception).lower()
+    
+    # Authentication/authorization errors
+    if any(term in error_str for term in ['unauthorized', 'forbidden', 'invalid api key', 'authentication', '401', '403']):
+        return True
+    
+    # Invalid request errors that won't be fixed by retrying
+    if any(term in error_str for term in ['invalid model', 'model not found', 'invalid request']):
+        return True
+    
+    return False
+
+def retry_with_exponential_backoff(
+    func,
+    max_retries: int = OPENAI_MAX_RETRIES,
+    initial_delay: float = OPENAI_RETRY_DELAY,
+    exponential_base: float = 2,
+    jitter: bool = True
+):
+    """
+    Retry a function with exponential backoff.
+    
+    Args:
+        func: Function to retry
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay between retries in seconds
+        exponential_base: Base for exponential backoff
+        jitter: Whether to add random jitter to delays
+        
+    Returns:
+        Result of the function call
+    """
+    import random
+    
+    def wrapper(*args, **kwargs):
+        num_retries = 0
+        delay = initial_delay
+        
+        while True:
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                # Check if this is a critical error that shouldn't be retried
+                if is_critical_api_error(e):
+                    logger.error(f"Critical API error in {func.__name__}: {str(e)}")
+                    raise
+                
+                num_retries += 1
+                
+                if num_retries > max_retries:
+                    logger.error(f"Maximum retries ({max_retries}) exceeded for {func.__name__}")
+                    raise
+                
+                # Log the retry attempt
+                logger.warning(f"Retry {num_retries}/{max_retries} for {func.__name__} after error: {str(e)}")
+                
+                # Calculate delay with optional jitter
+                if jitter:
+                    delay = delay * (1 + random.random() * 0.1)
+                
+                time.sleep(delay)
+                
+                # Exponential backoff
+                delay *= exponential_base
+                
+    return wrapper
 
 def get_supabase_client() -> Client:
     """
@@ -68,7 +160,7 @@ def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
     
     if not OPENAI_API_KEY:
         error_msg = "Cannot create embeddings - OPENAI_API_KEY not set"
-        print(f"ERROR: {error_msg}")
+        logger.error(error_msg)
         raise RuntimeError(error_msg)
     
     # Validate token lengths
@@ -85,22 +177,28 @@ def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
     for text in texts:
         tokens = encoding.encode(text)
         if len(tokens) > max_tokens:
-            print(f"WARNING: Text exceeds {max_tokens} token limit ({len(tokens)} tokens). Truncating...")
+            logger.warning(f"Text exceeds {max_tokens} token limit ({len(tokens)} tokens). Truncating...")
             # Truncate to fit within token limit
             truncated_tokens = tokens[:max_tokens]
             validated_texts.append(encoding.decode(truncated_tokens))
         else:
             validated_texts.append(text)
         
-    try:
-        response = openai.embeddings.create(
+    # Create a retry-wrapped version of the API call
+    @retry_with_exponential_backoff
+    def create_embeddings_with_retry():
+        return openai.embeddings.create(
             model=EMBEDDING_MODEL,
-            input=validated_texts
+            input=validated_texts,
+            timeout=OPENAI_TIMEOUT
         )
+    
+    try:
+        response = create_embeddings_with_retry()
         return [item.embedding for item in response.data]
     except Exception as e:
-        error_msg = f"Error creating batch embeddings: {e}"
-        print(error_msg)
+        error_msg = f"Error creating batch embeddings after {OPENAI_MAX_RETRIES} retries: {e}"
+        logger.error(error_msg)
         raise RuntimeError(error_msg) from e
 
 def create_embedding(text: str, contextual_prefix: Optional[str] = None) -> List[float]:
@@ -123,7 +221,7 @@ def create_embedding(text: str, contextual_prefix: Optional[str] = None) -> List
         return embeddings[0] if embeddings else []
     except Exception as e:
         error_msg = f"Error creating embedding: {e}"
-        print(error_msg)
+        logger.error(error_msg)
         raise RuntimeError(error_msg) from e
 
 def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, bool]:
@@ -149,7 +247,7 @@ def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, 
     valid_models = ["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4o", "gpt-4o-mini", 
                     "gpt-4.1-mini", "gpt-4.1-nano", "o1-preview", "o1-mini", "o3-mini", "o4-mini"]
     if model_choice not in valid_models:
-        print(f"WARNING: Invalid model '{model_choice}'. Using original chunk.")
+        logger.warning(f"Invalid model '{model_choice}'. Using original chunk.")
         return chunk, False
     
     try:
@@ -167,16 +265,22 @@ Here is the chunk we want to situate within the whole document
 </chunk> 
 Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval of the chunk. Answer only with the succinct context and nothing else."""
 
+        # Create a retry-wrapped version of the API call
+        @retry_with_exponential_backoff
+        def create_chat_completion_with_retry():
+            return openai.chat.completions.create(
+                model=model_choice,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that provides concise contextual information."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=200,
+                timeout=OPENAI_TIMEOUT
+            )
+        
         # Call the OpenAI API to generate contextual information
-        response = openai.chat.completions.create(
-            model=model_choice,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that provides concise contextual information."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
-            max_tokens=200
-        )
+        response = create_chat_completion_with_retry()
         
         # Extract the generated context
         context = response.choices[0].message.content.strip()
@@ -187,7 +291,7 @@ Please give a short succinct context to situate this chunk within the overall do
         return contextual_text, True
     
     except Exception as e:
-        print(f"Error generating contextual embedding: {e}. Using original chunk instead.")
+        logger.error(f"Error generating contextual embedding: {e}. Using original chunk instead.")
         return chunk, False
 
 def process_chunk_with_context(args):
@@ -213,8 +317,8 @@ def add_documents_to_supabase(
     contents: List[str], 
     metadatas: List[Dict[str, Any]],
     url_to_full_document: Dict[str, str],
-    batch_size: int = 20
-) -> None:
+    batch_size: int = None
+) -> int:
     """
     Add documents to the Supabase crawled_pages table in batches.
     Uses upsert to handle concurrent operations safely.
@@ -227,18 +331,29 @@ def add_documents_to_supabase(
         metadatas: List of document metadata
         url_to_full_document: Dictionary mapping URLs to their full document content
         batch_size: Size of each batch for insertion
+        
+    Returns:
+        Number of successfully stored chunks
+        
+    Raises:
+        ValueError: If input validation fails
+        RuntimeError: If critical errors occur during processing
     """
+    # Use environment variable if batch_size not provided
+    if batch_size is None:
+        batch_size = BATCH_SIZE
+        
     # Validate inputs
     if not urls or not contents:
-        print("WARNING: No documents to add to Supabase")
-        return
+        logger.warning("No documents to add to Supabase")
+        return 0
         
     if len(urls) != len(contents) or len(urls) != len(chunk_numbers) or len(urls) != len(metadatas):
         raise ValueError("Mismatched lengths for urls, contents, chunk_numbers, and metadatas")
     
     if batch_size <= 0:
-        print(f"WARNING: Invalid batch_size {batch_size}, using default 20")
-        batch_size = 20
+        logger.warning(f"Invalid batch_size {batch_size}, using default {BATCH_SIZE}")
+        batch_size = BATCH_SIZE
     
     # Note: Using upsert instead of delete+insert to avoid race conditions
     # The unique constraint on (url, chunk_number) will ensure no duplicates
@@ -246,6 +361,10 @@ def add_documents_to_supabase(
     # Check if MODEL_CHOICE is set for contextual embeddings
     model_choice = os.getenv("MODEL_CHOICE")
     use_contextual_embeddings = bool(model_choice)
+    
+    # Track successful chunks
+    successful_chunks = 0
+    failed_batches = 0
     
     # Process in batches to avoid memory issues
     for i in range(0, len(contents), batch_size):
@@ -268,7 +387,7 @@ def add_documents_to_supabase(
             
             # Process in parallel using ThreadPoolExecutor
             contextual_contents = [None] * len(batch_contents)  # Pre-allocate list with correct size
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=THREAD_POOL_MAX_WORKERS) as executor:
                 # Submit all tasks and collect results
                 future_to_idx = {executor.submit(process_chunk_with_context, arg): idx 
                                 for idx, arg in enumerate(process_args)}
@@ -282,14 +401,14 @@ def add_documents_to_supabase(
                         if success:
                             batch_metadatas[idx]["contextual_embedding"] = True
                     except Exception as e:
-                        print(f"Error processing chunk {idx}: {e}")
+                        logger.error(f"Error processing chunk {idx}: {e}")
                         # Use original content as fallback
                         contextual_contents[idx] = batch_contents[idx]
             
             # Check if any items are still None (shouldn't happen but be safe)
             for i, content in enumerate(contextual_contents):
                 if content is None:
-                    print(f"Warning: No result for chunk {i}, using original content")
+                    logger.warning(f"No result for chunk {i}, using original content")
                     contextual_contents[i] = batch_contents[i]
         else:
             # If not using contextual embeddings, use original contents
@@ -299,7 +418,13 @@ def add_documents_to_supabase(
         try:
             batch_embeddings = create_embeddings_batch(contextual_contents)
         except Exception as e:
-            print(f"Failed to create embeddings for batch. Skipping batch: {e}")
+            # Check if this is a critical error that should stop all processing
+            if is_critical_api_error(e):
+                logger.error(f"Critical API error encountered: {e}")
+                raise RuntimeError(f"Critical API error - cannot continue: {str(e)}")
+            
+            logger.error(f"Failed to create embeddings for batch {i//batch_size + 1}. Skipping batch: {e}")
+            failed_batches += 1
             continue
         
         batch_data = []
@@ -328,8 +453,29 @@ def add_documents_to_supabase(
         # Upsert batch into Supabase (insert or update based on unique constraint)
         try:
             client.table("crawled_pages").upsert(batch_data, on_conflict="url,chunk_number").execute()
+            successful_chunks += len(batch_data)
+            logger.debug(f"Successfully upserted batch {i//batch_size + 1} with {len(batch_data)} chunks")
         except Exception as e:
-            print(f"Error upserting batch into Supabase: {e}")
+            logger.error(f"Error upserting batch {i//batch_size + 1} into Supabase: {e}")
+            failed_batches += 1
+    
+    # Log summary
+    total_batches = len(range(0, len(contents), batch_size))
+    logger.info(f"Document storage complete: {successful_chunks}/{len(contents)} chunks stored, {failed_batches}/{total_batches} batches failed")
+    
+    # Check if failure threshold exceeded
+    if total_batches > 0:
+        failure_rate = failed_batches / total_batches
+        if failure_rate > BATCH_FAILURE_THRESHOLD:
+            error_msg = f"Batch failure rate ({failure_rate:.1%}) exceeded threshold ({BATCH_FAILURE_THRESHOLD:.1%}). {failed_batches}/{total_batches} batches failed."
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+    
+    # Raise error if no documents stored
+    if failed_batches > 0 and successful_chunks == 0:
+        raise RuntimeError(f"Failed to store any documents. All {failed_batches} batches failed.")
+    
+    return successful_chunks
 
 def search_documents(
     client: Client, 
@@ -354,12 +500,12 @@ def search_documents(
     # Validate query
     if not query or not query.strip():
         error_msg = "Empty query provided for search"
-        print(f"ERROR: {error_msg}")
+        logger.error(error_msg)
         raise ValueError(error_msg)
         
     # Validate match_count
     if match_count <= 0:
-        print(f"WARNING: Invalid match_count {match_count}, using default 10")
+        logger.warning(f"Invalid match_count {match_count}, using default 10")
         match_count = 10
     
     # Check if contextual embeddings are being used in storage
@@ -375,7 +521,7 @@ def search_documents(
             query_embedding = create_embedding(query)
     except Exception as e:
         error_msg = f"Failed to create embedding for query: {e}"
-        print(f"ERROR: {error_msg}")
+        logger.error(error_msg)
         raise RuntimeError(error_msg) from e
     
     # Execute the search using the match_crawled_pages function
@@ -402,5 +548,5 @@ def search_documents(
         return results
     except Exception as e:
         error_msg = f"Database error searching documents: {e}"
-        print(f"ERROR: {error_msg}")
+        logger.error(error_msg)
         raise RuntimeError(error_msg) from e

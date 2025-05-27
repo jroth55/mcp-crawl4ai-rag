@@ -35,6 +35,17 @@ This prevents accidentally crawling thousands of pages when you only wanted docu
 - **Concurrent Safety**: Uses database upserts instead of delete+insert to prevent race conditions during parallel crawling
 - **Better Error Handling**: OpenAI API key validation at startup with clear error messages
 
+### Recent Improvements (January 2025)
+- **Async Sitemap Parsing**: Replaced blocking requests with async httpx for non-blocking sitemap downloads
+- **Binary File Filtering**: Automatically skips ZIP, PDF, images, and other binary files to prevent crawling errors
+- **Comprehensive Logging**: All print statements replaced with structured logging for better debugging
+- **Smart Retry Logic**: OpenAI API calls now retry up to 3 times with exponential backoff, but skip auth/invalid model errors
+- **Partial Failure Reporting**: `smart_crawl_url` now returns detailed statistics about partial failures
+- **Configurable Everything**: New environment variables for fine-tuning batch sizes, timeouts, retry behavior, and more
+- **Critical Error Detection**: Distinguishes between retryable errors and critical failures (auth, invalid API key)
+- **Memory-Efficient Processing**: Documents processed in configurable batches to prevent memory exhaustion
+- **Thread-Safe Operations**: URL tracking uses proper locking for concurrent crawling safety
+
 ## Overview
 
 This MCP server provides tools that enable AI agents to crawl websites, store content in a vector database (Supabase), and perform RAG over the crawled content. It follows the best practices for building MCP servers based on the [Mem0 MCP server template](https://github.com/coleam00/mcp-mem0/) I provided on my channel previously.
@@ -88,6 +99,7 @@ Intelligently crawl websites with automatic content detection and boundary contr
   - `max_concurrent`: Parallel sessions (default: 10, max: 50)
   - `chunk_size`: Characters per chunk (default: 5000)
   - `prefix`: Custom crawl boundary (optional)
+  - `sitemap_max_depth`: Max recursion for nested sitemap indexes (optional, default from env)
 - **Returns**: Success status, crawl type, pages crawled, chunks stored, URLs processed
 
 ### 3. `get_available_sources`
@@ -198,12 +210,26 @@ SUPABASE_URL=your_supabase_project_url
 SUPABASE_SERVICE_KEY=your_supabase_service_key
 
 # Optional Configuration (with defaults)
+
+# Crawler Configuration
 # CRAWLER_MEMORY_THRESHOLD=70.0      # Memory threshold for adaptive dispatcher (%)
-# CRAWLER_CHECK_INTERVAL=1.0         # Check interval for memory monitoring (seconds)
+# CRAWLER_CHECK_INTERVAL=1.0         # Check interval for memory monitoring (seconds)  
 # CRAWLER_TIMEOUT=30000              # Timeout per page in milliseconds
 # MAX_DOCUMENT_LENGTH=25000          # Maximum document length for contextual embeddings
+# SITEMAP_MAX_DEPTH=2                # Maximum recursion depth for nested sitemap indexes
+
+# OpenAI Configuration
 # EMBEDDING_MODEL=text-embedding-3-small  # OpenAI embedding model to use
-# MODEL_CHOICE=gpt-3.5-turbo         # Model for contextual embeddings (if using)
+# MODEL_CHOICE=gpt-4.1-mini          # Model for contextual embeddings (recommended for best cost/performance)
+# OPENAI_MAX_RETRIES=3               # Maximum retries for OpenAI API calls
+# OPENAI_RETRY_DELAY=1.0             # Initial delay between retries (seconds)
+# OPENAI_TIMEOUT=30                  # Timeout for OpenAI API calls (seconds)
+
+# Batch Processing Configuration
+# EMBEDDING_BATCH_SIZE=20            # Number of text chunks per OpenAI embeddings API call
+# DOCUMENT_BATCH_SIZE=10             # Number of documents to process in memory at once
+# THREAD_POOL_MAX_WORKERS=10         # Max concurrent threads for contextual embeddings
+# BATCH_FAILURE_THRESHOLD=0.5        # Fail if more than 50% of batches fail
 ```
 
 **Note**: When `MCP_SERVER_API_KEY` is set, all SSE connections must include the `X-API-Key` header with this value.

@@ -14,15 +14,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Developer guide for contributors
 - Deployment guide covering multiple platforms
 - Troubleshooting guide for common issues
+- Health check endpoint at `/health` for monitoring
+- Configurable sitemap recursion depth via `SITEMAP_MAX_DEPTH` environment variable
+- Partial failure reporting in `smart_crawl_url` response with detailed statistics
+- Thread pool configuration via `THREAD_POOL_MAX_WORKERS` environment variable
+- Batch failure threshold configuration via `BATCH_FAILURE_THRESHOLD`
+- Critical API error detection to skip retries for auth/invalid model errors
+- Contextual embeddings support for improved RAG quality
+- Token length validation and truncation for OpenAI API limits
 
 ### Changed
-- [TODO: Add changes made in this version]
+- Logging levels optimized - routine success operations now use DEBUG level
+- RLS policies consolidated in `crawled_pages.sql` with idempotent DROP IF EXISTS statements
+- Improved error handling with specific error types in responses
+- Enhanced `smart_crawl_url` to accept `sitemap_max_depth` parameter
+- Memory-efficient batch processing for large crawls
 
 ### Fixed
-- [TODO: Add bug fixes in this version]
+- **Critical: 17.5-hour hang issue** - Replaced blocking `requests.get()` with async `httpx` client
+- **Binary file handling** - Added comprehensive filtering to prevent crawling non-HTML files
+- **Database vector dimension mismatch** - Enforced 1536-dimensional embeddings
+- **Contextual embedding asymmetry** - Added contextual prefix to query embeddings
+- **Storage vs retrieval content mismatch** - Now stores both original and contextual content
+- **Race conditions** - Added thread-safe URL tracking with locks
+- **Silent data loss** - Added failure thresholds and proper error propagation
+- **Code duplication** - Removed duplicate `is_binary_file` function definitions
 
 ### Removed
-- [TODO: Add removed features in this version]
+- Redundant `fix_rls_policies.sql` file (consolidated into `crawled_pages.sql`)
 
 ## [0.1.0] - 2024-01-XX
 

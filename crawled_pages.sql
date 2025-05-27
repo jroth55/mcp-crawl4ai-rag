@@ -77,6 +77,12 @@ $$;
 -- Enable RLS on the table
 alter table crawled_pages enable row level security;
 
+-- Drop existing RLS policies if they exist (for idempotency)
+drop policy if exists "Allow public read access" on crawled_pages;
+drop policy if exists "Allow service role insert" on crawled_pages;
+drop policy if exists "Allow service role update" on crawled_pages;
+drop policy if exists "Allow service role delete" on crawled_pages;
+
 -- Create a policy that allows anyone to read
 create policy "Allow public read access"
   on crawled_pages
