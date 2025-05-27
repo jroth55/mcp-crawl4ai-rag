@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Critical API error detection to skip retries for auth/invalid model errors
 - Contextual embeddings support for improved RAG quality
 - Token length validation and truncation for OpenAI API limits
+- Model recommendations section in README based on May 2025 benchmarks
+- Support for DeepSeek and Google Gemini models for contextual embeddings via OpenRouter
+- OpenRouter API integration for accessing DeepSeek and Google models
+- OPENROUTER_API_KEY environment variable support
 
 ### Changed
 - Logging levels optimized - routine success operations now use DEBUG level
@@ -29,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Improved error handling with specific error types in responses
 - Enhanced `smart_crawl_url` to accept `sitemap_max_depth` parameter
 - Memory-efficient batch processing for large crawls
+- Default MODEL_CHOICE changed from `gpt-4.1-mini` to `deepseek/deepseek-r1-distill-qwen-32b` for better cost/performance
+- Updated model validation to include OpenRouter-formatted model names
+- Added automatic OpenRouter client configuration for non-OpenAI models
 
 ### Fixed
 - **Critical: 17.5-hour hang issue** - Replaced blocking `requests.get()` with async `httpx` client

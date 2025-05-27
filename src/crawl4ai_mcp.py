@@ -38,7 +38,6 @@ from auth_mcp import AuthenticatedFastMCP
 # Configuration constants
 DEFAULT_MEMORY_THRESHOLD = float(os.getenv("CRAWLER_MEMORY_THRESHOLD", "70.0"))
 DEFAULT_CHECK_INTERVAL = float(os.getenv("CRAWLER_CHECK_INTERVAL", "1.0"))
-DEFAULT_TIMEOUT = int(os.getenv("CRAWLER_TIMEOUT", "30000"))  # 30 seconds
 MAX_DOCUMENT_LENGTH = int(os.getenv("MAX_DOCUMENT_LENGTH", "25000"))
 DOCUMENT_BATCH_SIZE = int(os.getenv("DOCUMENT_BATCH_SIZE", "10"))  # Process N documents at a time
 SITEMAP_MAX_DEPTH = int(os.getenv("SITEMAP_MAX_DEPTH", "2"))  # Max recursion depth for sitemap indexes
@@ -825,8 +824,7 @@ async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent:
     crawl_config = CrawlerRunConfig(
         cache_mode=CacheMode.BYPASS, 
         stream=False,
-        wait_until="domcontentloaded",  # Don't wait for all resources
-        timeout=DEFAULT_TIMEOUT
+        wait_until="domcontentloaded"  # Don't wait for all resources
     )
     dispatcher = MemoryAdaptiveDispatcher(
         memory_threshold_percent=DEFAULT_MEMORY_THRESHOLD,
@@ -862,8 +860,7 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
     run_config = CrawlerRunConfig(
         cache_mode=CacheMode.BYPASS, 
         stream=False,
-        wait_until="domcontentloaded",  # Don't wait for all resources
-        timeout=DEFAULT_TIMEOUT
+        wait_until="domcontentloaded"  # Don't wait for all resources
     )
     dispatcher = MemoryAdaptiveDispatcher(
         memory_threshold_percent=DEFAULT_MEMORY_THRESHOLD,

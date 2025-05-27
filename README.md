@@ -124,6 +124,7 @@ Search indexed content using semantic similarity.
 - [Python 3.12+](https://www.python.org/downloads/) if running the MCP server directly through uv
 - [Supabase](https://supabase.com/) (database for RAG)
 - [OpenAI API key](https://platform.openai.com/api-keys) (for generating embeddings)
+- [OpenRouter API key](https://openrouter.ai/keys) (optional - only if using DeepSeek or Google models for contextual embeddings)
 
 ## Installation
 
@@ -205,6 +206,9 @@ MCP_SERVER_API_KEY=your_secure_api_key
 # OpenAI API Configuration
 OPENAI_API_KEY=your_openai_api_key
 
+# OpenRouter API Configuration (optional - for DeepSeek/Google models)
+OPENROUTER_API_KEY=your_openrouter_api_key
+
 # Supabase Configuration
 SUPABASE_URL=your_supabase_project_url
 SUPABASE_SERVICE_KEY=your_supabase_service_key
@@ -219,8 +223,8 @@ SUPABASE_SERVICE_KEY=your_supabase_service_key
 # SITEMAP_MAX_DEPTH=2                # Maximum recursion depth for nested sitemap indexes
 
 # OpenAI Configuration
-# EMBEDDING_MODEL=text-embedding-3-small  # OpenAI embedding model to use
-# MODEL_CHOICE=gpt-4.1-mini          # Model for contextual embeddings (recommended for best cost/performance)
+# EMBEDDING_MODEL=text-embedding-3-small  # OpenAI embedding model to use (1536 dimensions, required by database)
+# MODEL_CHOICE=deepseek-r1-distill-qwen-32b  # Model for contextual embeddings (best value at ~$0.165/M tokens)
 # OPENAI_MAX_RETRIES=3               # Maximum retries for OpenAI API calls
 # OPENAI_RETRY_DELAY=1.0             # Initial delay between retries (seconds)
 # OPENAI_TIMEOUT=30                  # Timeout for OpenAI API calls (seconds)
@@ -233,6 +237,35 @@ SUPABASE_SERVICE_KEY=your_supabase_service_key
 ```
 
 **Note**: When `MCP_SERVER_API_KEY` is set, all SSE connections must include the `X-API-Key` header with this value.
+
+## Model Recommendations
+
+Based on May 2025 benchmarks and cost analysis, here are the recommended models:
+
+### Embedding Model
+**Default: OpenAI text-embedding-3-small**
+- Best value at $0.02/M tokens
+- 1536 dimensions (matches database schema)
+- MTEB Mean score: ~64.56
+- Note: The database is configured for 1536 dimensions, so changing to other embedding models would require schema changes
+
+### Contextual Embedding Model (MODEL_CHOICE)
+These models are used to generate contextual information for chunks to improve retrieval accuracy.
+
+**Best Value (Default): deepseek/deepseek-r1-distill-qwen-32b**
+- Cost: ~$0.15/M tokens (via OpenRouter)
+- Excellent reasoning capabilities (94.3% on MATH-500)
+- 128K token context window
+- Available through OpenRouter (requires `OPENROUTER_API_KEY`)
+
+**Alternative Options:**
+1. **OpenAI Ecosystem**: `gpt-4.1-mini` (~$0.38/M tokens, 1M context)
+2. **Speed Focus**: `google/gemini-2.5-flash` (~$0.21/M tokens via OpenRouter, 380 TPS)
+3. **Premium Performance**: `deepseek/deepseek-r1-distill-llama-70b` (~$0.60/M tokens via OpenRouter)
+
+**Note**: OpenRouter models require an `OPENROUTER_API_KEY` from https://openrouter.ai/keys
+
+To use no contextual embeddings (faster but less accurate), leave `MODEL_CHOICE` blank.
 
 ## Running the Server
 

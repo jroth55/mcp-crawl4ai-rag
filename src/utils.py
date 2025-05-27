@@ -245,7 +245,9 @@ def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, 
     
     # Validate model choice
     valid_models = ["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4o", "gpt-4o-mini", 
-                    "gpt-4.1-mini", "gpt-4.1-nano", "o1-preview", "o1-mini", "o3-mini", "o4-mini"]
+                    "gpt-4.1-mini", "gpt-4.1-nano", "o1-preview", "o1-mini", "o3-mini", "o4-mini",
+                    "deepseek/deepseek-r1-distill-qwen-32b", "deepseek/deepseek-r1-distill-llama-70b", 
+                    "deepseek/deepseek-v3", "google/gemini-2.5-flash", "google/gemini-2.0-flash-thinking"]
     if model_choice not in valid_models:
         logger.warning(f"Invalid model '{model_choice}'. Using original chunk.")
         return chunk, False
@@ -268,16 +270,44 @@ Please give a short succinct context to situate this chunk within the overall do
         # Create a retry-wrapped version of the API call
         @retry_with_exponential_backoff
         def create_chat_completion_with_retry():
-            return openai.chat.completions.create(
-                model=model_choice,
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant that provides concise contextual information."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,
-                max_tokens=200,
-                timeout=OPENAI_TIMEOUT
-            )
+            # Check if using OpenRouter models
+            if model_choice.startswith(("deepseek/", "google/", "meta/", "anthropic/")):
+                # OpenRouter configuration
+                import openai as openrouter_client
+                openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+                if not openrouter_api_key:
+                    logger.error("OPENROUTER_API_KEY not set for OpenRouter models")
+                    return chunk, False
+                
+                # Create a new client for OpenRouter
+                from openai import OpenAI
+                client = OpenAI(
+                    base_url="https://openrouter.ai/api/v1",
+                    api_key=openrouter_api_key
+                )
+                
+                return client.chat.completions.create(
+                    model=model_choice,
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant that provides concise contextual information."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.6 if "deepseek" in model_choice else 0.3,  # DeepSeek recommends 0.6
+                    max_tokens=200,
+                    timeout=OPENAI_TIMEOUT
+                )
+            else:
+                # Standard OpenAI API
+                return openai.chat.completions.create(
+                    model=model_choice,
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant that provides concise contextual information."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.3,
+                    max_tokens=200,
+                    timeout=OPENAI_TIMEOUT
+                )
         
         # Call the OpenAI API to generate contextual information
         response = create_chat_completion_with_retry()
