@@ -587,6 +587,7 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         # Start from homepage but only follow links in /blog/
         smart_crawl_url(url="https://example.com", prefix="https://example.com/blog")
     """
+    logger.info(f"smart_crawl_url called with url={url}, max_depth={max_depth}, max_concurrent={max_concurrent}")
     try:
         # Validate inputs
         if not url or not url.strip():
@@ -660,13 +661,26 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         crawl_results = []
         crawl_type = "webpage"
         
+        # Log progress: Starting crawl
+        logger.info(f"[CRAWL PROGRESS] Starting crawl of {url} - analyzing URL type...")
+        
+        # Report progress to client
+        await ctx.report_progress(0, 100)
+        ctx.info(f"Starting crawl of {url}")
+        
         # Detect URL type and use appropriate crawl method
         if is_txt(url):
             # For text files, use simple crawl
+            logger.info(f"[CRAWL PROGRESS] Detected text file - fetching content...")
+            ctx.info("Detected text file - fetching content...")
+            await ctx.report_progress(10, 100)
             crawl_results = await crawl_markdown_file(crawler, url)
             crawl_type = "text_file"
         elif is_sitemap(url):
             # For sitemaps, extract URLs and crawl in parallel
+            logger.info(f"[CRAWL PROGRESS] Detected sitemap - parsing sitemap structure...")
+            ctx.info("Detected sitemap - parsing structure...")
+            await ctx.report_progress(10, 100)
             sitemap_urls = await parse_sitemap(url, max_depth=sitemap_max_depth if sitemap_max_depth is not None else SITEMAP_MAX_DEPTH)
             if not sitemap_urls:
                 return json.dumps({
@@ -691,10 +705,16 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                         "error": f"No URLs in sitemap match the prefix '{prefix}'"
                     }, indent=2)
             
+            logger.info(f"[CRAWL PROGRESS] Found {len(sitemap_urls)} URLs in sitemap - starting parallel crawl...")
+            ctx.info(f"Found {len(sitemap_urls)} URLs in sitemap - starting crawl...")
+            await ctx.report_progress(20, 100)
             crawl_results = await crawl_batch(crawler, sitemap_urls, max_concurrent=max_concurrent)
             crawl_type = "sitemap"
         else:
             # For regular URLs, use recursive crawl
+            logger.info(f"[CRAWL PROGRESS] Starting recursive web crawl with max_depth={max_depth}...")
+            ctx.info(f"Starting recursive crawl (max depth: {max_depth})...")
+            await ctx.report_progress(10, 100)
             crawl_results = await crawl_recursive_internal_links(crawler, [url], max_depth=max_depth, max_concurrent=max_concurrent, prefix=prefix)
             crawl_type = "webpage"
         
@@ -705,6 +725,10 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                 "error": "No content found"
             }, indent=2)
         
+        logger.info(f"[CRAWL PROGRESS] Crawl complete - collected {len(crawl_results)} pages. Starting storage phase...")
+        ctx.info(f"Crawl complete - collected {len(crawl_results)} pages. Starting storage...")
+        await ctx.report_progress(40, 100)
+        
         # Process results in batches for memory efficiency
         total_chunks_stored = 0
         total_chunks_prepared = 0
@@ -713,11 +737,21 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         batch_failures = 0
         
         # Process documents in batches
+        total_batches = (len(crawl_results) + DOCUMENT_BATCH_SIZE - 1) // DOCUMENT_BATCH_SIZE
         for batch_start in range(0, len(crawl_results), DOCUMENT_BATCH_SIZE):
             batch_end = min(batch_start + DOCUMENT_BATCH_SIZE, len(crawl_results))
             batch = crawl_results[batch_start:batch_end]
+            batch_num = batch_start//DOCUMENT_BATCH_SIZE + 1
             
-            logger.debug(f"Processing document batch {batch_start//DOCUMENT_BATCH_SIZE + 1}: documents {batch_start+1}-{batch_end} of {len(crawl_results)}")
+            # Progress update every 5 batches or on first/last batch
+            if batch_num == 1 or batch_num == total_batches or batch_num % 5 == 0:
+                logger.info(f"[STORAGE PROGRESS] Processing batch {batch_num}/{total_batches} (documents {batch_start+1}-{batch_end} of {len(crawl_results)})")
+                # Calculate progress: 40% at start of storage, 90% at end
+                storage_progress = 40 + (50 * batch_num / total_batches)
+                await ctx.report_progress(storage_progress, 100)
+                ctx.info(f"Processing batch {batch_num}/{total_batches}")
+            else:
+                logger.debug(f"Processing document batch {batch_num}: documents {batch_start+1}-{batch_end} of {len(crawl_results)}")
             
             try:
                 # Process and store the batch
@@ -751,6 +785,10 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                 "error": "Failed to store any content in database"
             }, indent=2)
         
+        logger.info(f"[STORAGE PROGRESS] Storage phase complete - stored {total_chunks_stored}/{total_chunks_prepared} chunks from {pages_processed} pages")
+        ctx.info(f"Storage complete - stored {total_chunks_stored} chunks from {pages_processed} pages")
+        await ctx.report_progress(95, 100)
+        
         # Prepare response with detailed statistics
         response = {
             "success": True,
@@ -760,7 +798,7 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
             "pages_processed": pages_processed,
             "chunks_prepared": total_chunks_prepared,
             "chunks_stored": total_chunks_stored,
-            "urls_crawled": [doc['url'] for doc in crawl_results][:5] + (["..."] if len(crawl_results) > 5 else [])
+            "urls_crawled": [doc['url'] for doc in crawl_results[:5]] + (["..."] if len(crawl_results) > 5 else [])
         }
         
         # Add partial failure details if any
@@ -771,14 +809,29 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                 "total_batches": (len(crawl_results) + DOCUMENT_BATCH_SIZE - 1) // DOCUMENT_BATCH_SIZE,
                 "success_rate": f"{(total_chunks_stored / total_chunks_prepared * 100):.1f}%" if total_chunks_prepared > 0 else "0%"
             }
-            
-        return json.dumps(response, indent=2)
+        
+        # Log response before returning
+        response_json = json.dumps(response, indent=2)
+        logger.info(f"smart_crawl_url preparing to return response for {url}: {len(response_json)} bytes, {pages_processed} pages processed")
+        logger.debug(f"smart_crawl_url full response preview (first 500 chars): {response_json[:500]}...")
+        
+        # Add a small delay to ensure all async operations complete
+        await asyncio.sleep(0.1)
+        
+        logger.info(f"smart_crawl_url RETURNING NOW for {url}")
+        await ctx.report_progress(100, 100)
+        ctx.info("Operation complete!")
+        return response_json
     except Exception as e:
-        return json.dumps({
+        error_payload = {
             "success": False,
             "url": url,
             "error": str(e)
-        }, indent=2)
+        }
+        error_json = json.dumps(error_payload, indent=2)
+        logger.error(f"smart_crawl_url caught exception: {e}")
+        logger.error(f"smart_crawl_url is returning error response: {error_json}")
+        return error_json
 
 async def crawl_markdown_file(crawler: AsyncWebCrawler, url: str) -> List[Dict[str, Any]]:
     """
@@ -882,6 +935,9 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
     results_all = []
 
     for depth in range(max_depth):
+        # Progress update for each depth level
+        if depth == 0 or len(current_urls) > 0:
+            logger.info(f"[CRAWL PROGRESS] Processing depth {depth + 1}/{max_depth} - {len(current_urls)} URLs to crawl")
         logger.debug(f"Crawling depth {depth}, {len(current_urls)} URLs to process")
         
         # Thread-safe check for unvisited URLs
