@@ -538,6 +538,26 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
             "error": str(e)
         }, indent=2)
 
+async def send_heartbeat(ctx: Context, interval: float = 10.0):
+    """Send periodic heartbeat messages to keep SSE connection alive."""
+    heartbeat_count = 0
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            heartbeat_count += 1
+            try:
+                # Send a small progress update as heartbeat
+                ctx.info(f"Still processing... (heartbeat #{heartbeat_count})")
+                logger.debug(f"Heartbeat #{heartbeat_count} sent successfully")
+            except Exception as e:
+                # Connection is closed, stop heartbeat
+                logger.warning(f"Heartbeat #{heartbeat_count} failed: {e}")
+                break
+    except asyncio.CancelledError:
+        # Task was cancelled, this is expected
+        logger.debug(f"Heartbeat task cancelled after {heartbeat_count} heartbeats")
+        pass
+
 @mcp.tool()
 async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concurrent: int = 10, chunk_size: int = 5000, prefix: str = None, sitemap_max_depth: int = None) -> str:
     """
@@ -588,6 +608,10 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         smart_crawl_url(url="https://example.com", prefix="https://example.com/blog")
     """
     logger.info(f"smart_crawl_url called with url={url}, max_depth={max_depth}, max_concurrent={max_concurrent}")
+    
+    # Start heartbeat task to keep SSE connection alive
+    heartbeat_task = asyncio.create_task(send_heartbeat(ctx, interval=5.0))
+    
     try:
         # Validate inputs
         if not url or not url.strip():
@@ -665,22 +689,31 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         logger.info(f"[CRAWL PROGRESS] Starting crawl of {url} - analyzing URL type...")
         
         # Report progress to client
-        await ctx.report_progress(0, 100)
-        ctx.info(f"Starting crawl of {url}")
+        try:
+            await ctx.report_progress(0, 100)
+            ctx.info(f"Starting crawl of {url}")
+        except Exception as e:
+            logger.warning(f"Failed to send initial progress: {e}")
         
         # Detect URL type and use appropriate crawl method
         if is_txt(url):
             # For text files, use simple crawl
             logger.info(f"[CRAWL PROGRESS] Detected text file - fetching content...")
-            ctx.info("Detected text file - fetching content...")
-            await ctx.report_progress(10, 100)
+            try:
+                ctx.info("Detected text file - fetching content...")
+                await ctx.report_progress(10, 100)
+            except Exception as e:
+                logger.warning(f"Failed to send progress update: {e}")
             crawl_results = await crawl_markdown_file(crawler, url)
             crawl_type = "text_file"
         elif is_sitemap(url):
             # For sitemaps, extract URLs and crawl in parallel
             logger.info(f"[CRAWL PROGRESS] Detected sitemap - parsing sitemap structure...")
-            ctx.info("Detected sitemap - parsing structure...")
-            await ctx.report_progress(10, 100)
+            try:
+                ctx.info("Detected sitemap - parsing structure...")
+                await ctx.report_progress(10, 100)
+            except Exception as e:
+                logger.warning(f"Failed to send progress update: {e}")
             sitemap_urls = await parse_sitemap(url, max_depth=sitemap_max_depth if sitemap_max_depth is not None else SITEMAP_MAX_DEPTH)
             if not sitemap_urls:
                 return json.dumps({
@@ -706,15 +739,21 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                     }, indent=2)
             
             logger.info(f"[CRAWL PROGRESS] Found {len(sitemap_urls)} URLs in sitemap - starting parallel crawl...")
-            ctx.info(f"Found {len(sitemap_urls)} URLs in sitemap - starting crawl...")
-            await ctx.report_progress(20, 100)
+            try:
+                ctx.info(f"Found {len(sitemap_urls)} URLs in sitemap - starting crawl...")
+                await ctx.report_progress(20, 100)
+            except Exception as e:
+                logger.warning(f"Failed to send progress update: {e}")
             crawl_results = await crawl_batch(crawler, sitemap_urls, max_concurrent=max_concurrent)
             crawl_type = "sitemap"
         else:
             # For regular URLs, use recursive crawl
             logger.info(f"[CRAWL PROGRESS] Starting recursive web crawl with max_depth={max_depth}...")
-            ctx.info(f"Starting recursive crawl (max depth: {max_depth})...")
-            await ctx.report_progress(10, 100)
+            try:
+                ctx.info(f"Starting recursive crawl (max depth: {max_depth})...")
+                await ctx.report_progress(10, 100)
+            except Exception as e:
+                logger.warning(f"Failed to send progress update: {e}")
             crawl_results = await crawl_recursive_internal_links(crawler, [url], max_depth=max_depth, max_concurrent=max_concurrent, prefix=prefix)
             crawl_type = "webpage"
         
@@ -726,8 +765,11 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
             }, indent=2)
         
         logger.info(f"[CRAWL PROGRESS] Crawl complete - collected {len(crawl_results)} pages. Starting storage phase...")
-        ctx.info(f"Crawl complete - collected {len(crawl_results)} pages. Starting storage...")
-        await ctx.report_progress(40, 100)
+        try:
+            ctx.info(f"Crawl complete - collected {len(crawl_results)} pages. Starting storage...")
+            await ctx.report_progress(40, 100)
+        except Exception as e:
+            logger.warning(f"Failed to send progress update: {e}")
         
         # Process results in batches for memory efficiency
         total_chunks_stored = 0
@@ -748,8 +790,11 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                 logger.info(f"[STORAGE PROGRESS] Processing batch {batch_num}/{total_batches} (documents {batch_start+1}-{batch_end} of {len(crawl_results)})")
                 # Calculate progress: 40% at start of storage, 90% at end
                 storage_progress = 40 + (50 * batch_num / total_batches)
-                await ctx.report_progress(storage_progress, 100)
-                ctx.info(f"Processing batch {batch_num}/{total_batches}")
+                try:
+                    await ctx.report_progress(storage_progress, 100)
+                    ctx.info(f"Processing batch {batch_num}/{total_batches}")
+                except Exception as e:
+                    logger.warning(f"Failed to send batch progress update: {e}")
             else:
                 logger.debug(f"Processing document batch {batch_num}: documents {batch_start+1}-{batch_end} of {len(crawl_results)}")
             
@@ -786,8 +831,11 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
             }, indent=2)
         
         logger.info(f"[STORAGE PROGRESS] Storage phase complete - stored {total_chunks_stored}/{total_chunks_prepared} chunks from {pages_processed} pages")
-        ctx.info(f"Storage complete - stored {total_chunks_stored} chunks from {pages_processed} pages")
-        await ctx.report_progress(95, 100)
+        try:
+            ctx.info(f"Storage complete - stored {total_chunks_stored} chunks from {pages_processed} pages")
+            await ctx.report_progress(95, 100)
+        except Exception as e:
+            logger.warning(f"Failed to send storage complete update: {e}")
         
         # Prepare response with detailed statistics
         response = {
@@ -815,12 +863,13 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         logger.info(f"smart_crawl_url preparing to return response for {url}: {len(response_json)} bytes, {pages_processed} pages processed")
         logger.debug(f"smart_crawl_url full response preview (first 500 chars): {response_json[:500]}...")
         
-        # Add a small delay to ensure all async operations complete
-        await asyncio.sleep(0.1)
-        
         logger.info(f"smart_crawl_url RETURNING NOW for {url}")
-        await ctx.report_progress(100, 100)
-        ctx.info("Operation complete!")
+        try:
+            await ctx.report_progress(100, 100)
+            ctx.info("Operation complete!")
+        except Exception as e:
+            logger.warning(f"Failed to send final progress update: {e}")
+            # Continue anyway - the operation was successful
         return response_json
     except Exception as e:
         error_payload = {
@@ -832,6 +881,13 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         logger.error(f"smart_crawl_url caught exception: {e}")
         logger.error(f"smart_crawl_url is returning error response: {error_json}")
         return error_json
+    finally:
+        # Cancel heartbeat task
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
 
 async def crawl_markdown_file(crawler: AsyncWebCrawler, url: str) -> List[Dict[str, Any]]:
     """
